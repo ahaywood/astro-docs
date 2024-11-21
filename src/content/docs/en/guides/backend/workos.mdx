@@ -1,0 +1,372 @@
+---
+title: WorkOS & Astro
+description: Add authentication to your project with WorkOS
+type: backend
+service: WorkOS
+i18nReady: true
+---
+import PackageManagerTabs from '~/components/tabs/PackageManagerTabs.astro'
+import { FileTree } from '@astrojs/starlight/components';
+
+[WorkOS](https://workos.com) is a **User Management Platform** that provides authentication, directory sync, and audit trail features. It allows you to add enterprise-grade authentication to your application with a few lines of code.
+
+In this guide, we'll walk through adding a hosted authentication flow to your application using [AuthKit](https://workos.com/docs/user-management/authkit). However, you could use a custom login form and call the WorkOS API directly if you prefer.
+
+## Initializing WorkOS in Astro
+
+### Pre-requisites
+
+- A [WorkOS](https://dashboard.workos.com/signup) account. If you don't have one, you can sign up for free at [workos.com](https://workos.com).
+- An Astro project with [server-side rendering (SSR)](/en/guides/server-side-rendering/) enabled.
+- WorkOS credentials for your project. You can find these under the **Quick Start** section of your WorkOS dashboard.
+  - `WORKOS_CLIENT_ID`
+  - `WORKOS_API_KEY`
+
+To add your WorkOS credentials to your Astro project, add the following to your `.env` file:
+
+```ini title=".env"
+WORKOS_CLIENT_ID=YOUR_WORKOS_CLIENT_ID
+WORKOS_API_KEY=YOUR_WORKOS_API_KEY
+```
+
+Now, these environment variables are available in your project.
+
+If you would like to have IntelliSense for your environment variables, edit or create the `env.d.ts` in your `src/` directory and add the following:
+
+```ts title="src/env.d.ts"
+interface ImportMetaEnv {
+  readonly WORKOS_CLIENT_ID: string
+  readonly WORKOS_API_KEY: string
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv
+}
+```
+
+:::tip
+Read more about [environment variables](/en/guides/environment-variables/) and `.env` files in Astro.
+:::
+
+### Installing dependencies
+
+To connect to WorkOS, you'll need to install `@workos-inc/node` in your project:
+
+<PackageManagerTabs>
+  <Fragment slot="npm">
+  ```shell
+  npm install @workos-inc/node
+  ```
+  </Fragment>
+  <Fragment slot="pnpm">
+  ```shell
+  pnpm add @workos-inc/node
+  ```
+  </Fragment>
+  <Fragment slot="yarn">
+  ```shell
+  yarn add @workos-inc/node
+  ```
+  </Fragment>
+</PackageManagerTabs>
+
+Next, create a folder called `lib` inside your `src` directory. This is where we'll add our WorkOS client.
+
+In `workos.ts`, add the following to initialize your WorkOS client:
+
+```ts title="src/lib/workos.ts"
+import { WorkOS } from "@workos-inc/node";
+
+export const workos = new WorkOS(import.meta.env.WORKOS_API_KEY, {
+  clientId: import.meta.env.WORKOS_CLIENT_ID,
+});
+```
+
+Now, your project should include these files:
+
+<FileTree title="Project Structure">
+- src/
+  - lib/
+    - **workos.ts**
+  - env.d.ts
+- .env
+- astro.config.mjs
+- package.json
+</FileTree>
+
+## Configure a Redirect URI
+A redirect URI is a callback endpoint that WorkOS will redirect to after a user has authenticated. This endpoint will exchange the authorization code returned by WorkOS for an authenticated [User object](https://workos.com/docs/reference/user-management/user). We’ll create this endpoint in the next step.
+
+You can set a redirect URI in the Redirects section of the [WorkOS Dashboard](https://dashboard.workos.com/). While [wildcards](https://workos.com/docs/sso/redirect-uris/wildcard-characters) in your URIs can be used in the staging environment, they and query parameters cannot be used in production.
+
+![]()
+
+When users sign out of their application, they will be redirected to your app’s homepage which is configured in the same dashboard area.
+
+## Add AuthKit to your app
+
+Let’s integrate the hosted authentication flow into your app.
+
+### Set up the frontend
+To demonstrate AuthKit, we only need a simple page with links to logging in and out.
+
+```astro title="src/pages/index.astro"
+<!doctype html>
+<html lang="en">
+  <head>
+    <title>AuthKit example</title>
+  </head>
+  <body>
+    <h1>AuthKit example</h1>
+    <p>This is an example of how to use AuthKit with an HTML frontend.</p>
+    <p>
+      <a href="/login">Sign in</a>
+    </p>
+    <p>
+      <a href="/logout">Sign out</a>
+    </p>
+  </body>
+</html>
+```
+
+Clicking the “Sign in” and “Sign out” links should invoke actions on our server, which we’ll set up next
+
+### Redirect users to AuthKit
+We’ll need to direct users to sign in (or sign up) using AuthKit before redirecting them back to your application. We’ll do this by generating an AuthKit authorization URL server side and redirecting the user to it.
+
+You can use the optional state parameter to encode arbitrary information to help restore application `state` between redirects.
+
+```astro title="src/pages/login.astro"
+---
+import { workos } from './lib/workos.ts';
+
+const authorizationUrl = workos.userManagement.getAuthorizationUrl({
+  // Specify that we'd like AuthKit to handle the authentication flow
+  provider: "authkit",
+
+  // The callback endpoint that WorkOS will redirect to after a user authenticates
+  redirectUri: "http://localhost:4321/api/callback",
+  clientId: import.meta.env.WORKOS_CLIENT_ID as string,
+});
+
+// Redirect the user to the AuthKit sign-in page
+return Astro.redirect(authorizationUrl);
+---
+```
+
+Before we create our callback endpoint, let's set up our session.
+
+## Handle the user session
+Session management helper methods are included in our SDKs to make integration easy. For security reasons, sessions are automatically “sealed”, meaning they are encrypted with a strong password.
+
+### Create a session password
+The SDK requires you to set a strong password to encrypt cookies. This password must be 32 characters long. You can generate a secure password by using the [1Password generator](https://1password.com/password-generator/) or the openssl library via the command line:
+
+```shell
+openssl rand -base64 24
+```
+
+Then add it to the environment variables file.
+
+```
+WORKOS_API_KEY=
+WORKOS_CLIENT_ID=
+
+WORKOS_COOKIE_PASSWORD='<your password>'
+```
+
+### Add a callback endpoint and save the encrypted session
+Next, let’s add the callback endpoint (referenced in [Configure a redirect URI](https://workos.com/docs/user-management/1-configure-your-project/configure-a-redirect-uri)) which will exchange the authorization code (valid for 10 minutes) for an authenticated User object.
+
+Create a folder inside your `pages` directory called `api`. Inside, create a file called `callback.astro`. Inside, add the following code:
+```
+---
+import { workos } from "../../lib/workos.ts";
+
+// The authorization code returned by AuthKit
+const code = Astro.url.searchParams.get("code");
+
+if (!code) {
+  Astro.response.status = 400;
+  Astro.response.statusText = "No code provided";
+
+  // Redirect the user to the homepage
+  return Astro.redirect("/");
+}
+
+try {
+  const authenticateResponse = await workos.userManagement.authenticateWithCode(
+    {
+      clientId: import.meta.env.WORKOS_CLIENT_ID,
+      code,
+      session: {
+        sealSession: true,
+        cookiePassword: import.meta.env.WORKOS_COOKIE_PASSWORD,
+      },
+    }
+  );
+
+  const { user, sealedSession } = authenticateResponse;
+
+  // Store the session in a cookie
+  Astro.cookies.set("wos-session", sealedSession as string, {
+    path: "/",
+    httpOnly: true,
+    secure: true,
+    sameSite: "lax",
+  });
+
+  // Use the information in `user` for further business logic.
+
+  // Redirect the user to the homepage
+  return Astro.redirect("/");
+} catch (error) {
+  return Astro.redirect("/login");
+}
+---
+```
+
+This code also uses the WorkOS SDK to authenticate the user and return a password protected session. The refresh token is considered sensitive as it can be used to re-authenticate, hence why the session is encrypted before storing it in a session cookie.
+
+## Protected routes
+Then, use middleware to specify which routes should be protected. If the session has expired, use the SDK to attempt to generate a new one.
+
+Within the `src` directory, create a `middleware.ts` file.
+
+```ts title="src/middleware.ts"
+import { workos } from './lib/workos.ts';
+
+// Auth middleware function
+async function withAuth(context, next) {
+  const { cookies, redirect, req, res } = context;
+
+  const session = workos.userManagement.loadSealedSession({
+    sessionData: cookies['wos-session'],
+    cookiePassword: import.meta.env.WORKOS_COOKIE_PASSWORD,
+  });
+
+  const { authenticated, reason } = await session.authenticate();
+
+  if (authenticated) {
+    return next();
+  }
+
+  // If the cookie is missing, redirect to login
+  if (!authenticated && reason === 'no_session_cookie_provided') {
+    return redirect('/login');
+  }
+
+  // If the session is invalid, attempt to refresh
+  try {
+    const { authenticated, sealedSession } = await session.refresh();
+
+    if (!authenticated) {
+      return redirect('/login');
+    }
+
+    // update the cookie
+    cookies('wos-session', sealedSession, {
+      path: '/',
+      httpOnly: true,
+      secure: true,
+      sameSite: 'lax',
+    });
+
+    // Redirect to the same route to ensure the updated cookie is used
+    return redirect(req.originalUrl);
+  } catch (e) {
+    // Failed to refresh access token, redirect user to login page
+    // after deleting the cookie
+    cookies.delete('wos-session');
+    return redirect('/login');
+  }
+}
+
+export async function onRequest(context, next) {
+  // intercept data from a request
+  // optionally, modify the properties in `locals`
+  if (context.url.pathname.startsWith("/admin/")) {
+    await withAuth(context, next);
+  } else {
+    // return a Response or the result of calling `next()`
+    return next();
+  }
+};
+```
+
+Now, any route that starts with `/admin/` will be protected by the `withAuth` middleware. If the user is not authenticated, they will be redirected to the login page.
+
+Of course, you could adjust the directory name to suit your application’s needs.
+
+## Ending the Session
+
+Finally, ensure the user can end their session by redirecting them to the logout URL. After successfully signing out, the user will be redirected to your app’s homepage, which is configured in the WorkOS dashboard.
+
+Create a file called `logout.astro` in the `pages` directory.
+
+```astro ts="src/pages/logout.astro"
+---
+import { workos } from "../lib/workos.ts";
+
+const cookie = Astro.cookies.get("wos-session");
+
+// check to make sure that the session cookie exists
+if (!cookie) {
+  return Astro.redirect("/login");
+}
+
+try {
+  const session = workos.userManagement.loadSealedSession({
+    sessionData: cookie?.value as string,
+    cookiePassword: import.meta.env.WORKOS_COOKIE_PASSWORD,
+  });
+
+  const url = await session.getLogoutUrl();
+
+  Astro.cookies.delete("wos-session");
+  return Astro.redirect(url);
+} catch (error) {
+  console.error("Error logging out", error);
+  Astro.cookies.delete("wos-session");
+  return Astro.redirect("/login");
+}
+---
+```
+
+:::tip
+If you haven’t configured your app’s homepage in the WorkOS dashboard, users will see an error when logging out.
+:::
+
+## Displaying User Information the Page
+You can display user information on the page by using the `user` object returned by the `authenticateWithCode` method.
+
+At he top of the `index.astro` file:
+
+```astro title="src/pages/index.astro"
+---
+import { workos } from "../lib/workos.ts";
+
+const cookieSession = Astro.cookies.get("wos-session");
+
+const session = workos.userManagement.loadSealedSession({
+  sessionData: cookieSession?.value as string,
+  cookiePassword: import.meta.env.WORKOS_COOKIE_PASSWORD,
+});
+
+const result = await session.authenticate();
+const { user } = result;
+---
+```
+
+Now, within the page HTML, you add:
+
+```astro title="src/pages/index.astro"
+{user && `User ${user.firstName} is logged in`}
+```
+
+When the user is logged in, it will display their first name.
+
+## Additional Resources:
+- [AuthKit](https://www.authkit.com/)
+- [User Management WorkOS Documentation](https://workos.com/docs/user-management/vanilla/nodejs/3-handle-the-user-session/validate-the-authentication-flow)
+- [Example Application on GitHub](https://github.com/ahaywood/workos-astro-hosted-auth-demo)
